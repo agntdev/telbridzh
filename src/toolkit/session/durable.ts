@@ -37,6 +37,7 @@ export interface DOStub {
 }
 export interface WorkerEnv {
   BOT_TOKEN: string;
+  ADMIN_CHAT_ID?: string;
   WEBHOOK_SECRET?: string;
   CHAT_DO: DONamespace;
   DB?: unknown; // D1 binding (app data); see AGENTS.md
@@ -49,6 +50,54 @@ interface Reminder {
   at: number; // epoch ms
   chatId: number | string;
   text: string;
+}
+
+/** A persistent relay audit record. Message content is retained for at most 90 days. */
+export interface RelayAttempt {
+  timestamp: number;
+  senderId: number;
+  targetPhone: string;
+  messageText: string;
+  deliveryResult: string;
+}
+
+const RELAY_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+
+function relayDay(timestamp: number): string {
+  return new Date(timestamp).toISOString().slice(0, 10);
+}
+
+function relayAuditStub(env: WorkerEnv): DOStub | undefined {
+  if (!env.CHAT_DO) return undefined;
+  return env.CHAT_DO.get(env.CHAT_DO.idFromName("relay-audit"));
+}
+
+/** Store an attempt in the dedicated durable audit object. Never falls back to memory. */
+export async function recordRelayAttempt(env: WorkerEnv | undefined, attempt: RelayAttempt): Promise<boolean> {
+  const stub = env ? relayAuditStub(env) : undefined;
+  if (!stub) return false;
+  try {
+    const response = await stub.fetch("https://do/relay/attempt", {
+      method: "POST",
+      body: JSON.stringify(attempt),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Read newest audit entries through an explicit day index, without keyspace scans. */
+export async function listRelayAttempts(env: WorkerEnv | undefined, limit = 20): Promise<RelayAttempt[] | undefined> {
+  const stub = env ? relayAuditStub(env) : undefined;
+  if (!stub) return undefined;
+  try {
+    const response = await stub.fetch(`https://do/relay/attempts?limit=${Math.max(1, Math.min(limit, 50))}`);
+    if (!response.ok) return undefined;
+    return (await response.json()) as RelayAttempt[];
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -152,6 +201,48 @@ export class ChatDO {
       await this.state.storage.put("reminders", list);
       await this.rearm(list);
       return new Response(null, { status: 204 });
+    }
+
+    if (url.pathname === "/relay/attempt" && request.method === "POST") {
+      const attempt = (await request.json()) as RelayAttempt;
+      const cutoff = attempt.timestamp - RELAY_RETENTION_MS;
+      const days = (await this.state.storage.get<string[]>("relay:days")) ?? [];
+      const retainedDays = days.filter((day) => Date.parse(`${day}T00:00:00.000Z`) >= cutoff);
+      for (const day of days) {
+        if (!retainedDays.includes(day)) await this.state.storage.delete(`relay:day:${day}`);
+      }
+      const day = relayDay(attempt.timestamp);
+      const entries = (await this.state.storage.get<RelayAttempt[]>(`relay:day:${day}`)) ?? [];
+      entries.push(attempt);
+      await this.state.storage.put(`relay:day:${day}`, entries);
+      if (!retainedDays.includes(day)) retainedDays.push(day);
+      retainedDays.sort();
+      await this.state.storage.put("relay:days", retainedDays);
+      return new Response(null, { status: 204 });
+    }
+
+    if (url.pathname === "/relay/attempts" && request.method === "GET") {
+      const requested = Number(url.searchParams.get("limit"));
+      const limit = Number.isFinite(requested) ? Math.max(1, Math.min(Math.floor(requested), 50)) : 20;
+      const now = Date.now();
+      const days = (await this.state.storage.get<string[]>("relay:days")) ?? [];
+      const retainedDays = days.filter((day) => Date.parse(`${day}T00:00:00.000Z`) >= now - RELAY_RETENTION_MS);
+      const attempts: RelayAttempt[] = [];
+      for (const day of [...retainedDays].sort().reverse()) {
+        const entries = (await this.state.storage.get<RelayAttempt[]>(`relay:day:${day}`)) ?? [];
+        for (const entry of [...entries].reverse()) {
+          if (entry.timestamp >= now - RELAY_RETENTION_MS) attempts.push(entry);
+          if (attempts.length >= limit) break;
+        }
+        if (attempts.length >= limit) break;
+      }
+      if (retainedDays.length !== days.length) {
+        for (const day of days) {
+          if (!retainedDays.includes(day)) await this.state.storage.delete(`relay:day:${day}`);
+        }
+        await this.state.storage.put("relay:days", retainedDays.sort());
+      }
+      return Response.json(attempts);
     }
 
     return new Response("not found", { status: 404 });
