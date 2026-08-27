@@ -1,19 +1,31 @@
 [
   {
-    "name": "Send message by phone",
+    "name": "Проверка формата номера",
     "steps": [
       {
-        "expect": [
-          {
-            "method": "sendMessage",
-            "payload": {
-              "text": "Initiates message sending flow"
-            }
-          }
-        ],
-        "send": {
-          "callback": "send:start"
-        }
+        "send": { "callback": "send:start" },
+        "expect": [{ "method": "sendMessage", "payload": { "text": "Введите номер получателя в формате +79991234567." } }]
+      },
+      {
+        "send": { "text": "79991234567" },
+        "expect": [{ "method": "sendMessage", "payload": { "text": "Номер не подходит. Укажите его в формате +79991234567." } }]
+      }
+    ]
+  },
+  {
+    "name": "Доставка по номеру честно сообщает ограничение Bot API",
+    "steps": [
+      {
+        "send": { "callback": "send:start" },
+        "expect": [{ "method": "sendMessage", "payload": { "text": "Введите номер получателя в формате +79991234567." } }]
+      },
+      {
+        "send": { "text": "+79991234567" },
+        "expect": [{ "method": "sendMessage", "payload": { "text": "Введите текст сообщения." } }]
+      },
+      {
+        "send": { "text": "Добрый день" },
+        "expect": [{ "method": "sendMessage", "payload": { "text": "Доставка не выполнена. Код: UNSUPPORTED_PHONE_LOOKUP.\nTelegram Bot API не позволяет найти получателя только по номеру телефона." } }]
       }
     ]
   }
